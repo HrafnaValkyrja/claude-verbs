@@ -12,4 +12,4 @@ Status: design.
 - `hive/verbs/`: generic verbs (sh, edit, trash, git/ship, unit, job)
 - site adapters: separate packages with verbs for one deployment (hosts, nodes, limits)
 
-Kept generic so a universal version can be opened later; site-specific verbs live in adapters, not the core.
+Generic core; site-specific verbs live in adapters, not the core.
