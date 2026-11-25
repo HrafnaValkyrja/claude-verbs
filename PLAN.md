@@ -39,3 +39,17 @@ Not in scope: a new language (it's Python), an LLM in the execution path (a mode
 
 ## Narrowing check
 At each phase start, reread "The goal" and "Scope" above and ask: am I building the next phase, or only the next function? If a phase starts to shrink to "just make the test pass", stop and reread.
+
+## From prior art (phase 0, 11-25)
+- Build, small. Nothing existing does all of this; the closest (an experimental JS code mode inside one agent) has no dry run, risk classes or report. Use it as a baseline arm in the replay.
+- Build then run: verbs create inert steps; `run(plan)` checks policy and dry-runs before anything executes (plumbum's split).
+- Dry run is honest: each verb declares whether it can simulate; the report marks "NOT SIMULATED" otherwise (Ansible).
+- No plan-time branching on results (pyinfra's trap): conditions on a step's output use lazy references (`when=step.ok`, `step.out`) resolved at run time.
+- Fail by default; `ok_codes=` for exceptions. Stop-on-fail needs no flag.
+- Resume cheaply: opt-in `creates=` / `unless=` per step, so a rerun skips what's done (doit).
+- Policy is a TOML file keyed on risk class, deny beats allow, checked by the runner on run-time values (hooks only see `run plan.py`, so the runner enforces).
+- The report is the product: one line per step; full output only for the failing step.
+- The skill tells the agent: use a plan for 3+ dependent steps; a single call stays a normal tool call.
+- Savings are proved by our own replay, not quoted from others.
+- The learning loop proposes verbs; a human or the owning agent decides.
+Sources: research notes kept by the maintainer.
