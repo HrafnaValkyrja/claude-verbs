@@ -4,12 +4,83 @@ Write what you want done as one Python file of verbs. The runner executes it top
 
 Built for agent sessions that spend most of their turns on shell plumbing: one plan, one run, one report.
 
-Status: design.
+Status: phase 1 (core). See [PLAN.md](PLAN.md).
 
-## Layout (planned)
-- `hive/core.py`: steps, stop-on-fail, report, risk gate, dry mode
-- `hive/run.py`: `python3 -m hive.run plan.py [--dry]`
-- `hive/verbs/`: generic verbs (sh, edit, trash, git/ship, unit, job)
-- site adapters: separate packages with verbs for one deployment (hosts, nodes, limits)
+## Install
 
-Generic core; site-specific verbs live in adapters, not the core.
+    pip install .            # Python >= 3.10, no runtime dependencies on 3.11+
+
+## Example
+
+`plan.py`:
+
+```python
+from claude_verbs import sh, write, edit
+
+write("app.conf", "port = 8080\n", creates="app.conf")   # skipped on a rerun
+edit("app.conf", "8080", "9090")                          # old text must occur exactly once
+size = sh("wc -c app.conf")
+sh(size.out.map(str.split).map(lambda p: p[0]).fmt("echo size={}"))  # lazy: resolved at run time
+sh("grep -q 7070 app.conf")                               # fails, so the run stops here
+sh("echo never runs")
+```
+
+    $ claude-verbs run plan.py          # or: python3 -m claude_verbs run plan.py
+
+```
+run d6612395: 4 ok, 1 failed, 1 skipped
+ 1 ok            write app.conf  (0.00s)
+ 2 ok            edit app.conf  (0.00s)
+ 3 ok            sh wc -c app.conf  (0.00s)
+ 4 ok            sh echo size=12  (0.00s)
+ 5 failed        sh grep -q 7070 app.conf  (0.00s)  - exit 1
+ 6 skipped       sh echo never runs  (0.00s)  - not reached
+```
+
+Exit code: 0 ok, 1 a step failed, 2 policy denied or bad input. Add `--dry` to simulate: verbs that can simulate (`edit`, `write`, `trash`) check their preconditions and change nothing; the rest are reported `not-simulated`, never "ok".
+
+## Interface
+
+```python
+Plan(steps=None)                          # context manager; steps made inside are collected
+run(plan, dry=False, *, policy=None, log_dir=None, raise_on_fail=True) -> Report
+sh(cmd, cwd=None, env=None, host=None, *, timeout=300, **opts)   # host= is reserved
+edit(path, old, new, **opts)              # exact, unique replace
+write(path, text, **opts)                 # atomic; creates parent dirs
+trash(path, **opts)                       # to the trash dir; step output is an item id
+restore(item_id, trash_directory=None)    # put it back, never overwrites
+```
+
+Options on every verb: `risk="safe|care|gated"`, `approval="why"`, `when=`, `creates=`, `unless=`, `ok_codes=(0,)` (for `sh`). A later step can use an earlier step's `.ok`, `.out`, `.err`, `.code` as a lazy reference (`.map(fn)`, `.fmt("..{}..")`); using one in `if` or an f-string at plan time raises, because the value does not exist yet.
+
+## Risk policy
+
+Each step has a risk class. A TOML file (`--policy`, `policy=`, or `$CLAUDE_VERBS_POLICY`; built-in default otherwise) says what each class needs and adds regex rules over the step's command or path:
+
+```toml
+[classes]
+gated = "approval"        # allow | approval | deny
+
+[[rules]]
+action = "deny"           # deny always wins
+verb = "sh"               # optional
+match = "curl .*\\| *sh"
+```
+
+Order: any deny wins; then approval rules; then allow rules (waive a class's approval); then the class. `approval="..."` on a step satisfies "approval". Checked once before anything runs and again on each step's run-time values. Deletes go through `trash`; the default policy denies `rm -r`/`rm -f`.
+
+## Logs
+
+Every run appends JSONL to `~/.local/state/claude-verbs/runs/` (override: `log_dir=`, `--log-dir`, `$CLAUDE_VERBS_LOG_DIR`).
+
+## Layout
+- `claude_verbs/core.py`: steps, lazy references, runner, report
+- `claude_verbs/policy.py`: risk policy
+- `claude_verbs/runlog.py`: JSONL run log
+- `claude_verbs/verbs.py`: generic verbs (`sh`, `edit`, `write`, `trash`)
+- `claude_verbs/cli.py`: command line
+- site adapters: separate packages with verbs for one deployment; the core never imports them
+
+## Tests
+
+    pip install pytest && pytest
