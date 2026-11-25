@@ -30,6 +30,9 @@ def main(argv=None) -> int:
     except FileNotFoundError:
         print(f"claude-verbs: no such plan file: {a.plan}", file=sys.stderr)
         return 2
+    if not plan.steps:
+        print(f"claude-verbs: {a.plan} made no steps; nothing ran", file=sys.stderr)
+        return 2
     try:
         report = run(plan, dry=a.dry, policy=a.policy, log_dir=a.log_dir)
     except PolicyDenied as e:

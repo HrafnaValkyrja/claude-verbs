@@ -180,11 +180,16 @@ class Plan:
         self._token = None
 
     def __enter__(self):
+        self._outer = _active.get(None)
         self._token = _active.set(self)
         return self
 
     def __exit__(self, *exc):
         _active.reset(self._token)
+        # A plan opened inside another (e.g. a plan file that opens its own Plan under the CLI's)
+        # is a group of the outer one, never a second plan that silently doesn't run.
+        if self._outer is not None:
+            self._outer.steps.extend(self.steps)
 
 
 @dataclass
