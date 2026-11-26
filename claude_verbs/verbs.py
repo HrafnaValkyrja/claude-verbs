@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 
 from .core import Step, vfs
-from .proc import DEFAULT_TIMEOUT, SAFE_REMOTE_PATH, SSH_OPTS, remote_command, run_proc, ssh_argv
+from .proc import DEFAULT_TIMEOUT, SAFE_REMOTE_PATH, SSH_OPTS, is_local, local_path, remote_command, run_proc, ssh_argv
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -45,6 +45,9 @@ def sh(cmd: str, cwd=None, env: dict | None = None, host: str | None = None, *,
         limit = _timeout if _timeout is not None else timeout
         if a["host"] is None:
             return run_proc(a["cmd"], shell=True, cwd=a["cwd"], env=a["env"], timeout=limit)
+        if is_local(a["host"]):   # aimed at this machine: run here, with remote-style cwd
+            cwd = local_path(a["cwd"]) if a["cwd"] is not None else os.path.expanduser("~")
+            return run_proc(a["cmd"], shell=True, cwd=cwd, env=a["env"], timeout=limit)
         remote = remote_command(a["cmd"], a["cwd"], a["env"])
         return run_proc(ssh_argv(a["host"], remote, connect_timeout), timeout=limit)
 
@@ -167,8 +170,8 @@ def copy(src, dest, host: str | None = None, *, timeout: float = DEFAULT_TIMEOUT
         if not s.exists():
             raise FileNotFoundError(str(s))
         limit = _timeout if _timeout is not None else timeout
-        if a["host"] is None:
-            d = Path(a["dest"])
+        if a["host"] is None or is_local(a["host"]):
+            d = Path(a["dest"] if a["host"] is None else local_path(a["dest"]))
             d.parent.mkdir(parents=True, exist_ok=True)
             if s.is_dir():
                 shutil.copytree(s, d, dirs_exist_ok=True)

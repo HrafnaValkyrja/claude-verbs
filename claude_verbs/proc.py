@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import signal
+import socket
 import subprocess
 
 from .core import Outcome
@@ -33,6 +34,27 @@ def run_proc(cmd, *, shell=False, cwd=None, env: dict | None = None,
         out, err = proc.communicate()
         return Outcome(-9, out or "", err or "", f"timed out after {timeout:g}s")
     return Outcome(proc.returncode, out, err)
+
+
+def is_local(host: str | None) -> bool:
+    """True when host names this machine (localhost, or its own hostname, short or full).
+    A step aimed at its own host runs here instead of ssh-ing to itself, which can fail
+    host-key checks (found 11-25 when a plan written for both hosts ran on one of them).
+    user@host is never treated as local: it may mean a different account."""
+    if host is None:
+        return True
+    h = host.strip().lower()
+    if "@" in h:
+        return False
+    me = socket.gethostname().lower()
+    return h in {"localhost", "127.0.0.1", "::1", me, me.split(".")[0]}
+
+
+def local_path(path) -> str:
+    """A remote-style path read on this machine: ~ expands, and a relative path is
+    relative to home, as scp and ssh treat it."""
+    p = os.path.expanduser(str(path))
+    return p if os.path.isabs(p) else os.path.join(os.path.expanduser("~"), p)
 
 
 def ssh_argv(host: str, remote_cmd: str, connect_timeout: int) -> list[str]:
