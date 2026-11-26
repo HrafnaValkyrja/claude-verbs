@@ -26,6 +26,8 @@ DEFAULT = {
         {"action": "deny", "verb": "sh", "match": r"(^|[;&|(]\s*)rm\s+-\w*[rRf]"},
         {"action": "approval", "verb": "sh", "match": r"\bgit\s+push\b.*(--force|-f\b)"},
         {"action": "approval", "verb": "sh", "match": r"(^|[;&|(]\s*)sudo\b"},
+        # Piping a download straight into a shell runs code nobody read.
+        {"action": "deny", "verb": "sh", "match": r"\b(curl|wget)\b[^|]*\|\s*(sudo\s+)?(ba|z)?sh\b"},
     ],
 }
 
@@ -57,6 +59,27 @@ class Policy:
                 raise ValueError(f"bad rule action {r.get('action')!r}")
             re.compile(r["match"])
         self.classes, self.rules = classes, rules
+        # dry_first: risk classes whose steps run for real only after a dry run of the same
+        # plan text (within dry_first_minutes). dry_first_from = "module:function" returns
+        # that list at run time instead (an add-on can tie it to live state).
+        self.dry_first = list(data.get("dry_first", []))
+        self.dry_first_from = data.get("dry_first_from")
+        self.dry_first_minutes = float(data.get("dry_first_minutes", 30))
+        for risk in self.dry_first:
+            if risk not in RISKS:
+                raise ValueError(f"unknown risk class {risk!r} in dry_first")
+
+    def dry_first_classes(self) -> list:
+        """The classes that need a dry run first, now. A failing dry_first_from falls back to dry_first."""
+        if self.dry_first_from:
+            try:
+                import importlib
+                mod, _, fn = self.dry_first_from.partition(":")
+                got = list(getattr(importlib.import_module(mod), fn)())
+                return [r for r in got if r in RISKS]
+            except Exception:
+                pass
+        return self.dry_first
 
     @classmethod
     def default(cls) -> "Policy":
@@ -72,11 +95,15 @@ class Policy:
 
     @classmethod
     def resolve(cls, policy=None) -> "Policy":
-        """Policy object, path, or None (env CLAUDE_VERBS_POLICY, else default)."""
+        """Policy object, path, or None (env CLAUDE_VERBS_POLICY, else
+        ~/.config/claude-verbs/policy.toml if it exists, else built-in)."""
         if isinstance(policy, Policy):
             return policy
         if policy is None:
             policy = os.environ.get("CLAUDE_VERBS_POLICY") or None
+        if policy is None:
+            user = Path.home() / ".config/claude-verbs/policy.toml"
+            policy = user if user.is_file() else None
         return cls.load(Path(policy)) if policy else cls.default()
 
     def check(self, verb: str, risk: str, subject: str | None) -> Decision:

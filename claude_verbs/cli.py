@@ -8,10 +8,15 @@ READS-BY: console script `claude-verbs`, `python -m claude_verbs`
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
+import time
+from pathlib import Path
 import runpy
 import sys
 
 from .core import Plan, PolicyDenied, RunError, run
+from .policy import Policy
 
 
 def main(argv=None) -> int:
@@ -34,8 +39,15 @@ def main(argv=None) -> int:
     if not plan.steps:
         print(f"claude-verbs: {a.plan} made no steps; nothing ran", file=sys.stderr)
         return 2
+    pol = Policy.resolve(a.policy)
+    need = sorted({s.risk for s in plan.steps} & set(pol.dry_first_classes()))
+    stamp = _dry_stamp(a.plan)
+    if need and not a.dry and not _fresh(stamp, pol.dry_first_minutes):
+        print(f"claude-verbs: this plan has {'/'.join(need)} steps and the policy wants a dry run first; "
+              f"run it with --dry, read the report, then run it again", file=sys.stderr)
+        return 2
     try:
-        report = run(plan, dry=a.dry, policy=a.policy, log_dir=a.log_dir, verbose=a.verbose)
+        report = run(plan, dry=a.dry, policy=pol, log_dir=a.log_dir, verbose=a.verbose)
     except PolicyDenied as e:
         print(e.report)
         print(f"claude-verbs: {e}", file=sys.stderr)
@@ -43,5 +55,22 @@ def main(argv=None) -> int:
     except RunError as e:
         print(e.report)
         return 1
+    if a.dry:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
     print(report)
     return 0
+
+
+def _dry_stamp(plan_path) -> Path:
+    """One stamp per plan text: an edited plan needs a new dry run."""
+    digest = hashlib.sha256(Path(plan_path).read_bytes()).hexdigest()[:16]
+    base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    return base / "claude-verbs" / "dry" / digest
+
+
+def _fresh(stamp: Path, minutes: float) -> bool:
+    try:
+        return time.time() - stamp.stat().st_mtime < minutes * 60
+    except OSError:
+        return False
