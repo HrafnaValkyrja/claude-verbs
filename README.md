@@ -4,7 +4,7 @@ Write what you want done as one Python file of verbs. The runner executes it top
 
 Built for agent sessions that spend most of their turns on shell plumbing: one plan, one run, one report.
 
-Status: phase 2 (core, remote hosts, git change flow, `ship`). See [PLAN.md](PLAN.md).
+Status: v0.1.0. Core, remote hosts, git change flow, `ship`, risk policy, run log. See [PLAN.md](PLAN.md) and [CHANGELOG.md](CHANGELOG.md).
 
 ## Install
 
@@ -37,6 +37,8 @@ run d6612395: 4 ok, 1 failed, 1 skipped
  6 skipped       sh echo never runs  (0.00s)  - not reached
 ```
 
+`--verbose` (`run(..., verbose=True)`) shows every ok step's output; by default only failed steps print theirs.
+
 Exit code: 0 ok, 1 a step failed, 2 policy denied or bad input. Add `--dry` to simulate: verbs that can simulate (`edit`, `write`, `copy`, `trash`, git verbs) check their preconditions and change nothing; the rest are reported `not-simulated`, never "ok".
 
 ## Interface
@@ -59,7 +61,7 @@ ship(repo, reason, edits=(), files=None, branch=None, base="main", merge=True,
      deploy=(), after=(), cleanup=True)   # the whole chain, one report line per stage
 ```
 
-Options on every verb: `risk="safe|care|gated"`, `approval="why"`, `when=`, `creates=`, `unless=`, `ok_codes=(0,)` (for `sh`). A later step can use an earlier step's `.ok`, `.out`, `.err`, `.code` as a lazy reference (`.map(fn)`, `.fmt("..{}..")`); using one in `if` or an f-string at plan time raises, because the value does not exist yet.
+Options on every verb: `risk="safe|care|gated"`, `approval="why"`, `when=`, `creates=`, `unless=`, `ok_codes=(0,)` (for `sh`), `show=True` (print this step's output even when it succeeded), `retries=N` with `retry_delay=` seconds, `timeout=` (default 300s; `run(..., default_timeout=)` changes the default for custom steps). A later step can use an earlier step's `.ok`, `.out`, `.err`, `.code` as a lazy reference (`.map(fn)`, `.fmt("..{}..")`); using one in `if` or an f-string at plan time raises, because the value does not exist yet.
 
 ## Ship a change
 
@@ -84,6 +86,18 @@ run 3f9a1c20: 8 ok
 ```
 
 (timings trimmed). If a stage fails, later stages are `skipped` but the worktree removal still runs. `--dry` shows the same chain; `edit` and `copy` are checked against the files earlier steps would create, and `after` commands are `not-simulated`.
+
+## Measured: four real tasks, replayed
+
+Four changes an agent had made by hand in one day (a script fix shipped to two hosts; a stale-row fix shipped and checked on two hosts; two long-running agents switched to another model through their terminal panes; a config file plus a code change with a live check) were rewritten as plans of 19 to 32 lines and run end to end against a throwaway repository with fake `ssh`, `scp` and `gh` (nothing live touched).
+
+| | by hand | as plans |
+|---|---|---|
+| tool calls, all four tasks | 37 | 21 (17 without a separate `--dry` pass) |
+| of which reading code to find the cause | 13 | 13 |
+| mechanical calls (worktree, edit, commit, push, PR, merge, deploy, verify, message) | 24 | 8 |
+
+A plan removes plumbing, not thinking: the reading stays. Each plan run gave one report of 12 to 18 lines.
 
 ## Risk policy
 

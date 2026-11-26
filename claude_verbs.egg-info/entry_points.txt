@@ -1,2 +1,0 @@
-[console_scripts]
-claude-verbs = claude_verbs.cli:main
