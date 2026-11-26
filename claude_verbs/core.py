@@ -24,6 +24,7 @@ from .runlog import RunLog
 _active: contextvars.ContextVar["Plan | None"] = contextvars.ContextVar("plan", default=None)
 _vfs_var: contextvars.ContextVar["VirtualFS | None"] = contextvars.ContextVar("vfs", default=None)
 TAIL_LINES = 200
+DEFAULT_TIMEOUT = 300.0  # seconds a step may run unless it sets timeout= (sh sets its own)
 
 
 class RunError(Exception):
@@ -162,7 +163,8 @@ class Step:
                  risk: str = "care", simulate: Callable | None = None,
                  subject: Callable | None = None, when=None, creates=None,
                  unless=None, approval=None, timeout: float | None = None,
-                 ok_codes=(0,), always: bool = False, group: str | None = None):
+                 ok_codes=(0,), always: bool = False, group: str | None = None,
+                 show: bool = False, retries: int = 0, retry_delay: float = 1.0):
         if risk not in ("safe", "care", "gated"):
             raise ValueError(f"risk must be safe|care|gated, not {risk!r}")
         self.verb, self.risk, self.args = verb, risk, args or {}
@@ -173,6 +175,9 @@ class Step:
         # always: still runs after an earlier failure (cleanup). group: a verb that
         # expands into several steps (ship) names itself so the report shows where.
         self.always, self.group = always, group
+        # show: print this step's output under its line even when it succeeded.
+        # retries: extra tries after a failure (retry_delay seconds apart); not in dry runs.
+        self.show, self.retries, self.retry_delay = show, int(retries), float(retry_delay)
         self.result: StepResult | None = None
         self.can_simulate = simulate is not None
         plan = _active.get()
@@ -246,6 +251,8 @@ class Report:
     dry: bool
     results: list[StepResult] = field(default_factory=list)
     log_path: Path | None = None
+    verbose: bool = False
+    shown: set = field(default_factory=set)
 
     @property
     def ok(self) -> bool:
@@ -263,7 +270,8 @@ class Report:
             if r.detail:
                 line += f"  - {r.detail}"
             lines.append(line)
-            if r.status == "failed":
+            if r.status == "failed" or (r.status == "ok" and not r.dry
+                                        and (self.verbose or r.index in self.shown)):
                 text = "\n".join(x for x in (r.out.rstrip(), r.err.rstrip()) if x)
                 tail = text.splitlines()
                 if len(tail) > TAIL_LINES:
@@ -304,16 +312,18 @@ def _static(step: Step):
 
 
 def run(plan, dry: bool = False, *, policy=None, log_dir=None,
-        raise_on_fail: bool = True) -> Report:
+        raise_on_fail: bool = True, verbose: bool = False,
+        default_timeout: float = DEFAULT_TIMEOUT) -> Report:
     """Run a Plan (or list of Steps); see _run. A dry run gets a fresh VirtualFS."""
     token = _vfs_var.set(VirtualFS() if dry else None)
     try:
-        return _run(plan, dry, policy=policy, log_dir=log_dir, raise_on_fail=raise_on_fail)
+        return _run(plan, dry, policy=policy, log_dir=log_dir, raise_on_fail=raise_on_fail,
+                    verbose=verbose, default_timeout=default_timeout)
     finally:
         _vfs_var.reset(token)
 
 
-def _run(plan, dry, *, policy, log_dir, raise_on_fail) -> Report:
+def _run(plan, dry, *, policy, log_dir, raise_on_fail, verbose, default_timeout) -> Report:
     """Run a Plan (or list of Steps). Policy is checked on every step before
     anything executes (class level, plus values known at plan time) and again
     on each step's run-time values. First failure stops the run."""
@@ -322,7 +332,7 @@ def _run(plan, dry, *, policy, log_dir, raise_on_fail) -> Report:
     for s in steps:
         s.result = None
     run_id = uuid.uuid4().hex[:8]
-    report = Report(run_id, dry)
+    report = Report(run_id, dry, verbose=verbose)
 
     for i, s in enumerate(steps, 1):
         args, approval = _static(s)
@@ -391,17 +401,31 @@ def _run(plan, dry, *, policy, log_dir, raise_on_fail) -> Report:
             if probe.returncode == 0:
                 record(i, s, "skipped", t0, args, detail="unless: probe succeeded")
                 continue
-        try:
-            res = s._do(args, s.timeout)
-            o = res if isinstance(res, Outcome) else Outcome(0, res or "")
-            if o.code in s.ok_codes:
-                record(i, s, "ok", t0, args, o)
+        limit = s.timeout if s.timeout is not None else default_timeout
+        tries = 1 + max(0, s.retries)
+        for attempt in range(1, tries + 1):
+            try:
+                res = s._do(args, limit)
+                outcome = res if isinstance(res, Outcome) else Outcome(0, res or "")
+                good = outcome.code in s.ok_codes
+                err_detail = outcome.detail or f"exit {outcome.code}"
+            except Exception as e:
+                good, outcome = False, None
+                err_detail = str(e) or type(e).__name__
+            if not good and attempt < tries:
+                time.sleep(s.retry_delay)
+                continue
+            if good:
+                if s.show:
+                    report.shown.add(i)
+                record(i, s, "ok", t0, args, outcome,
+                       detail=f"after {attempt} tries" if attempt > 1 else "")
             else:
                 failure = StepFailed
-                record(i, s, "failed", t0, args, o, detail=o.detail or f"exit {o.code}")
-        except Exception as e:
-            failure = StepFailed
-            record(i, s, "failed", t0, args, detail=str(e) or type(e).__name__)
+                if tries > 1:
+                    err_detail = f"{err_detail} (after {tries} tries)"
+                record(i, s, "failed", t0, args, outcome, detail=err_detail)
+            break
 
     log.event("run_end", ok=report.ok)
     if failure and raise_on_fail:

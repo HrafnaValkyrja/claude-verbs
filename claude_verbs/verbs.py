@@ -49,6 +49,7 @@ def sh(cmd: str, cwd=None, env: dict | None = None, host: str | None = None, *,
         return run_proc(ssh_argv(a["host"], remote, connect_timeout), timeout=limit)
 
     opts.setdefault("risk", "care")
+    opts.setdefault("timeout", timeout)
     return Step("sh", do, {"cmd": cmd, "cwd": cwd, "env": env, "host": host},
                 subject=lambda a: a["cmd"], **opts)
 

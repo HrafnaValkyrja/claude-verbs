@@ -20,6 +20,7 @@ def main(argv=None) -> int:
     r = sub.add_parser("run", help="run a plan file")
     r.add_argument("plan")
     r.add_argument("--dry", action="store_true", help="simulate; change nothing")
+    r.add_argument("--verbose", "-v", action="store_true", help="show every ok step's output")
     r.add_argument("--policy", help="TOML policy file (default: $CLAUDE_VERBS_POLICY, else built-in)")
     r.add_argument("--log-dir", help="directory for the JSONL run log")
     a = ap.parse_args(argv)
@@ -34,7 +35,7 @@ def main(argv=None) -> int:
         print(f"claude-verbs: {a.plan} made no steps; nothing ran", file=sys.stderr)
         return 2
     try:
-        report = run(plan, dry=a.dry, policy=a.policy, log_dir=a.log_dir)
+        report = run(plan, dry=a.dry, policy=a.policy, log_dir=a.log_dir, verbose=a.verbose)
     except PolicyDenied as e:
         print(e.report)
         print(f"claude-verbs: {e}", file=sys.stderr)
