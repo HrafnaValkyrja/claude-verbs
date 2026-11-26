@@ -22,6 +22,7 @@ from .policy import Decision, Policy
 from .runlog import RunLog
 
 _active: contextvars.ContextVar["Plan | None"] = contextvars.ContextVar("plan", default=None)
+_vfs_var: contextvars.ContextVar["VirtualFS | None"] = contextvars.ContextVar("vfs", default=None)
 TAIL_LINES = 200
 
 
@@ -84,6 +85,49 @@ def _resolve(v):
     return v
 
 
+class VirtualFS:
+    """What a dry run believes the file system looks like after the earlier steps.
+
+    Simulating verbs record the files they would write here (known[path] is the
+    text, or None when the content is not text) and read from it before the disk,
+    so `edit` after `write` to a new path simulates correctly. An alias maps a
+    directory that does not exist yet (a worktree) onto a real one it is a copy of.
+    """
+
+    def __init__(self):
+        self.known: dict[Path, str | None] = {}
+        self.aliases: list[tuple[Path, Path]] = []
+
+    def _real(self, p: Path) -> Path:
+        for prefix, real in self.aliases:
+            if p == prefix or prefix in p.parents:
+                return real / p.relative_to(prefix)
+        return p
+
+    def exists(self, path) -> bool:
+        p = Path(path).absolute()
+        return p in self.known or self._real(p).exists()
+
+    def read(self, path) -> str:
+        p = Path(path).absolute()
+        if p in self.known:
+            if self.known[p] is None:
+                raise ValueError(f"{p} would exist but its content is not simulated")
+            return self.known[p]
+        return self._real(p).read_text()
+
+    def write(self, path, text: str | None) -> None:
+        self.known[Path(path).absolute()] = text
+
+    def alias(self, prefix, real) -> None:
+        self.aliases.append((Path(prefix).absolute(), Path(real).absolute()))
+
+
+def vfs() -> VirtualFS:
+    """The active dry run's virtual file system (a throwaway one outside a run)."""
+    return _vfs_var.get() or VirtualFS()
+
+
 @dataclass
 class Outcome:
     code: int = 0
@@ -118,7 +162,7 @@ class Step:
                  risk: str = "care", simulate: Callable | None = None,
                  subject: Callable | None = None, when=None, creates=None,
                  unless=None, approval=None, timeout: float | None = None,
-                 ok_codes=(0,)):
+                 ok_codes=(0,), always: bool = False, group: str | None = None):
         if risk not in ("safe", "care", "gated"):
             raise ValueError(f"risk must be safe|care|gated, not {risk!r}")
         self.verb, self.risk, self.args = verb, risk, args or {}
@@ -126,6 +170,9 @@ class Step:
         self._subject = subject or (lambda a: " ".join(str(v) for v in a.values()))
         self.when, self.creates, self.unless = when, creates, unless
         self.approval, self.timeout, self.ok_codes = approval, timeout, tuple(ok_codes)
+        # always: still runs after an earlier failure (cleanup). group: a verb that
+        # expands into several steps (ship) names itself so the report shows where.
+        self.always, self.group = always, group
         self.result: StepResult | None = None
         self.can_simulate = simulate is not None
         plan = _active.get()
@@ -165,7 +212,8 @@ class Step:
         except Exception:
             text = "..."
         text = " ".join(str(text).split())
-        return f"{self.verb} {text[:60] + ('...' if len(text) > 60 else '')}".strip()
+        body = f"{self.verb} {text[:60] + ('...' if len(text) > 60 else '')}".strip()
+        return f"[{self.group}] {body}" if self.group else body
 
     def __repr__(self):
         return f"<Step {self.label()}>"
@@ -257,6 +305,15 @@ def _static(step: Step):
 
 def run(plan, dry: bool = False, *, policy=None, log_dir=None,
         raise_on_fail: bool = True) -> Report:
+    """Run a Plan (or list of Steps); see _run. A dry run gets a fresh VirtualFS."""
+    token = _vfs_var.set(VirtualFS() if dry else None)
+    try:
+        return _run(plan, dry, policy=policy, log_dir=log_dir, raise_on_fail=raise_on_fail)
+    finally:
+        _vfs_var.reset(token)
+
+
+def _run(plan, dry, *, policy, log_dir, raise_on_fail) -> Report:
     """Run a Plan (or list of Steps). Policy is checked on every step before
     anything executes (class level, plus values known at plan time) and again
     on each step's run-time values. First failure stops the run."""
@@ -292,7 +349,7 @@ def run(plan, dry: bool = False, *, policy=None, log_dir=None,
         return r
 
     for i, s in enumerate(steps, 1):
-        if failure:
+        if failure and not s.always:
             record(i, s, "skipped", time.monotonic(), detail="not reached")
             continue
         t0 = time.monotonic()

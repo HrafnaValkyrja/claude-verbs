@@ -4,7 +4,7 @@ Write what you want done as one Python file of verbs. The runner executes it top
 
 Built for agent sessions that spend most of their turns on shell plumbing: one plan, one run, one report.
 
-Status: phase 1 (core). See [PLAN.md](PLAN.md).
+Status: phase 2 (core, remote hosts, git change flow, `ship`). See [PLAN.md](PLAN.md).
 
 ## Install
 
@@ -37,21 +37,53 @@ run d6612395: 4 ok, 1 failed, 1 skipped
  6 skipped       sh echo never runs  (0.00s)  - not reached
 ```
 
-Exit code: 0 ok, 1 a step failed, 2 policy denied or bad input. Add `--dry` to simulate: verbs that can simulate (`edit`, `write`, `trash`) check their preconditions and change nothing; the rest are reported `not-simulated`, never "ok".
+Exit code: 0 ok, 1 a step failed, 2 policy denied or bad input. Add `--dry` to simulate: verbs that can simulate (`edit`, `write`, `copy`, `trash`, git verbs) check their preconditions and change nothing; the rest are reported `not-simulated`, never "ok".
 
 ## Interface
 
 ```python
 Plan(steps=None)                          # context manager; steps made inside are collected
 run(plan, dry=False, *, policy=None, log_dir=None, raise_on_fail=True) -> Report
-sh(cmd, cwd=None, env=None, host=None, *, timeout=300, **opts)   # host= is reserved
+sh(cmd, cwd=None, env=None, host=None, *, timeout=300, connect_timeout=10, **opts)
+                                          # host=: over ssh -o BatchMode=yes, cwd/env shell-quoted
+copy(src, dest, host=None, **opts)        # local copy, or scp to host:dest (plain remote paths only)
 edit(path, old, new, **opts)              # exact, unique replace
 write(path, text, **opts)                 # atomic; creates parent dirs
 trash(path, **opts)                       # to the trash dir; step output is an item id
 restore(item_id, trash_directory=None)    # put it back, never overwrites
+worktree(repo, branch, base="origin/main", path=None)   # sibling worktree; refuses the main checkout
+commit(path, message, author=None, all=True)
+push(path, branch)
+pr(repo_path, title, body="", base="main", merge=False, method="squash")  # gh REST; lazy .number .url
+ship(repo, reason, edits=(), files=None, branch=None, base="main", merge=True,
+     deploy=(), after=(), cleanup=True)   # the whole chain, one report line per stage
 ```
 
 Options on every verb: `risk="safe|care|gated"`, `approval="why"`, `when=`, `creates=`, `unless=`, `ok_codes=(0,)` (for `sh`). A later step can use an earlier step's `.ok`, `.out`, `.err`, `.code` as a lazy reference (`.map(fn)`, `.fmt("..{}..")`); using one in `if` or an f-string at plan time raises, because the value does not exist yet.
+
+## Ship a change
+
+```python
+from claude_verbs import ship
+ship("~/code/widgets", "Say moon, not world",
+     edits=[("app.txt", "world", "moon")],
+     deploy=[("app.txt", "/srv/app/app.txt", "web1")],   # (file in repo, dest, host or None)
+     after=["echo restarted"])
+```
+
+```
+run 3f9a1c20: 8 ok
+ 1 ok            [ship] worktree add /code/widgets-ship-say-moon-not-world-a1b2c3 ...
+ 2 ok            [ship] edit /code/widgets-ship-say-moon-not-world-a1b2c3/app.txt
+ 3 ok            [ship] commit /code/widgets-ship-say-moon-not-world-a1b2c3 Say moon, not world
+ 4 ok            [ship] push /code/widgets-ship-say-moon-not-world-a1b2c3 ship/say-moon-not-world-a1b2c3
+ 5 ok            [ship] pr /code/widgets-ship-say-moon-not-world-a1b2c3 Say moon, not world
+ 6 ok            [ship] copy /code/widgets-ship-say-moon-not-world-a1b2c3/app.txt web1:/srv/app/app.txt
+ 7 ok            [ship] sh echo restarted
+ 8 ok            [ship] worktree remove /code/widgets-ship-say-moon-not-world-a1b2c3
+```
+
+(timings trimmed). If a stage fails, later stages are `skipped` but the worktree removal still runs. `--dry` shows the same chain; `edit` and `copy` are checked against the files earlier steps would create, and `after` commands are `not-simulated`.
 
 ## Risk policy
 
@@ -77,7 +109,7 @@ Every run appends JSONL to `~/.local/state/claude-verbs/runs/` (override: `log_d
 - `claude_verbs/core.py`: steps, lazy references, runner, report
 - `claude_verbs/policy.py`: risk policy
 - `claude_verbs/runlog.py`: JSONL run log
-- `claude_verbs/verbs.py`: generic verbs (`sh`, `edit`, `write`, `trash`)
+- `claude_verbs/verbs.py`: generic verbs (`sh`, `copy`, `edit`, `write`, `trash`)
 - `claude_verbs/cli.py`: command line
 - site adapters: separate packages with verbs for one deployment; the core never imports them
 

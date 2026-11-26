@@ -1,4 +1,4 @@
-"""Generic verbs: sh, edit, write, trash (+ restore).
+"""Generic verbs: sh (local or over ssh), copy, edit, write, trash (+ restore).
 
 PURPOSE: the everyday actions a plan is made of, each an inert Step.
 WHY: edits are exact and unique, writes are atomic, deletes are recoverable.
@@ -11,16 +11,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
-import subprocess
 import tempfile
 import time
 import uuid
 from pathlib import Path
 
-from .core import Outcome, Step
-
-DEFAULT_TIMEOUT = 300.0
+from .core import Step, vfs
+from .proc import DEFAULT_TIMEOUT, SAFE_REMOTE_PATH, SSH_OPTS, remote_command, run_proc, ssh_argv
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -39,34 +36,28 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def sh(cmd: str, cwd=None, env: dict | None = None, host: str | None = None, *,
-       timeout: float = DEFAULT_TIMEOUT, **opts) -> Step:
-    """Run a shell command. host is reserved for remote adapters."""
-    if host is not None:
-        raise NotImplementedError("host= is reserved; remote execution is not in the core")
+       timeout: float = DEFAULT_TIMEOUT, connect_timeout: int = 10, **opts) -> Step:
+    """Run a shell command, here or on host over ssh (BatchMode, never prompts).
 
+    With host, cwd and env apply on the remote side and are shell-quoted; cmd is
+    shell text for the remote shell. A remote command is risk "care"."""
     def do(a, _timeout):
         limit = _timeout if _timeout is not None else timeout
-        proc = subprocess.Popen(
-            a["cmd"], shell=True, cwd=a["cwd"], text=True, start_new_session=True,
-            env={**os.environ, **(a["env"] or {})},
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            out, err = proc.communicate(timeout=limit)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            out, err = proc.communicate()
-            return Outcome(-9, out or "", err or "", f"timed out after {limit:g}s")
-        return Outcome(proc.returncode, out, err)
+        if a["host"] is None:
+            return run_proc(a["cmd"], shell=True, cwd=a["cwd"], env=a["env"], timeout=limit)
+        remote = remote_command(a["cmd"], a["cwd"], a["env"])
+        return run_proc(ssh_argv(a["host"], remote, connect_timeout), timeout=limit)
 
-    return Step("sh", do, {"cmd": cmd, "cwd": cwd, "env": env},
+    opts.setdefault("risk", "care")
+    return Step("sh", do, {"cmd": cmd, "cwd": cwd, "env": env, "host": host},
                 subject=lambda a: a["cmd"], **opts)
 
 
 def edit(path, old: str, new: str, **opts) -> Step:
     """Replace old with new in a file; old must occur exactly once."""
-    def check(a):
+    def check(a, read=lambda p: p.read_text()):
         p = Path(a["path"])
-        text = p.read_text()
+        text = read(p)
         n = text.count(a["old"])
         if not a["old"]:
             raise ValueError("old text is empty")
@@ -80,7 +71,9 @@ def edit(path, old: str, new: str, **opts) -> Step:
         return f"edited {p}"
 
     def simulate(a):
-        p, _ = check(a)
+        v = vfs()
+        p, text = check(a, v.read)
+        v.write(p, text.replace(a["old"], a["new"], 1))
         return f"edit {p} (1 match)"
 
     return Step("edit", do, {"path": path, "old": old, "new": new}, simulate=simulate,
@@ -100,8 +93,10 @@ def write(path, text: str, **opts) -> Step:
         return f"wrote {a['path']}"
 
     def simulate(a):
-        p = check(a)
-        return f"{'overwrite' if p.exists() else 'create'} {p} ({len(a['text'])} chars)"
+        p, v = check(a), vfs()
+        verb = "overwrite" if v.exists(p) else "create"
+        v.write(p, a["text"])
+        return f"{verb} {p} ({len(a['text'])} chars)"
 
     return Step("write", do, {"path": path, "text": text}, simulate=simulate,
                 subject=lambda a: str(a["path"]), **opts)
@@ -150,3 +145,55 @@ def restore(item_id: str, trash_directory=None) -> Path:
     shutil.move(str(box / "payload"), str(dest))
     shutil.rmtree(box)
     return dest
+
+
+def copy(src, dest, host: str | None = None, *, timeout: float = DEFAULT_TIMEOUT,
+         connect_timeout: int = 10, **opts) -> Step:
+    """Copy a file (or directory) from here to dest, or to dest on host over scp.
+
+    The remote path must be plain (letters, digits and ./@%+=,~-): scp hands it
+    to a remote shell, so anything else is refused rather than half-quoted."""
+    def check(a):
+        if a["host"] is not None:
+            if a["host"].startswith("-"):
+                raise ValueError(f"bad host {a['host']!r}")
+            if not SAFE_REMOTE_PATH.match(str(a["dest"])):
+                raise ValueError(f"remote path {str(a['dest'])!r} has characters scp would reinterpret")
+
+    def do(a, _timeout):
+        check(a)
+        s = Path(a["src"])
+        if not s.exists():
+            raise FileNotFoundError(str(s))
+        limit = _timeout if _timeout is not None else timeout
+        if a["host"] is None:
+            d = Path(a["dest"])
+            d.parent.mkdir(parents=True, exist_ok=True)
+            if s.is_dir():
+                shutil.copytree(s, d, dirs_exist_ok=True)
+            else:
+                shutil.copy2(s, d)
+            return f"copied {s} to {d}"
+        argv = ["scp", "-q", *SSH_OPTS, "-o", f"ConnectTimeout={connect_timeout}"]
+        if s.is_dir():
+            argv.append("-r")
+        argv += ["--", str(s), f"{a['host']}:{a['dest']}"]
+        return run_proc(argv, timeout=limit)
+
+    def simulate(a):
+        check(a)
+        v, s = vfs(), Path(a["src"])
+        if not v.exists(s):
+            raise FileNotFoundError(str(s))
+        if a["host"] is not None:
+            return f"copy {s} to {a['host']}:{a['dest']}"
+        try:
+            v.write(a["dest"], v.read(s))
+        except (OSError, ValueError):
+            v.write(a["dest"], None)
+        return f"copy {s} to {a['dest']}"
+
+    opts.setdefault("risk", "care")
+    return Step("copy", do, {"src": src, "dest": dest, "host": host}, simulate=simulate,
+                subject=lambda a: f"{a['src']} {a['host'] + ':' if a['host'] else ''}{a['dest']}",
+                **opts)
